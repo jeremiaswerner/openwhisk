@@ -1,0 +1,20 @@
+; the first parameter in a host is the inventory_hostname which has to be
+; either an ip
+; or a resolvable hostname
+
+; used for local actions only
+ansible ansible_connection=local
+[registry]
+10.10.0.6
+[edge]
+10.10.0.2
+[controllers]
+10.10.0.2
+[kafka]
+10.10.0.2
+[consul_servers]
+10.10.0.2
+[invokers]
+10.20.0.2
+[db]
+10.10.0.2
