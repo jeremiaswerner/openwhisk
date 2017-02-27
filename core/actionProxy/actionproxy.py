@@ -25,6 +25,7 @@ from gevent.wsgi import WSGIServer
 import zipfile
 import io
 import base64
+from subprocess import check_output
 
 class ActionRunner:
 
@@ -115,16 +116,29 @@ class ActionRunner:
 
         try:
             input = json.dumps(args)
+            sys.stdout.write('start calling client code %s\n' % self.binary)
             p = subprocess.Popen(
                 [ self.binary, input ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                bufsize=1,
+                #stdout=subprocess.PIPE,
+                #stderr=subprocess.PIPE,
                 env=env)
+            sys.stdout.write('done calling client code\n')
         except Exception as e:
             return error(e)
 
         # run the process and wait until it completes.
-        (o, e) = p.communicate()
+        sys.stdout.write('start comminicate to client code\n')
+        # lines = []
+        # for line in iter(p.stdout.readline, ''):
+        #       print line,          # print to stdout immediately
+        #       lines.append(line)   # capture for later
+        # p.stdout.close()
+        # p.wait()
+        p.wait()
+        o = None
+        e = None
+        sys.stdout.write('done comminicate to client code out=%s and err=%s\n' % (o, e))
 
         if o is not None:
             process_output_lines = o.strip().split('\n')
@@ -136,7 +150,7 @@ class ActionRunner:
 
         if e is not None:
             sys.stderr.write(e)
-
+ 
         try:
             json_output = json.loads(last_line)
             if isinstance(json_output, dict):
