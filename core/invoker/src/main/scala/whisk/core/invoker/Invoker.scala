@@ -17,15 +17,12 @@
 package whisk.core.invoker
 
 import java.nio.charset.StandardCharsets
-
 import java.time.{ Clock, Instant }
-
 import scala.concurrent.{ Await, ExecutionContext, Future }
 import scala.concurrent.Promise
 import scala.concurrent.duration.{ Duration, DurationInt }
 import scala.language.postfixOps
 import scala.util.{ Failure, Success }
-
 import akka.actor.{ ActorRef, ActorSystem, actorRef2Scala }
 import akka.japi.Creator
 import spray.json._
@@ -45,6 +42,9 @@ import whisk.http.Messages
 import whisk.utils.ExecutionContextFactory
 import whisk.common.Scheduler
 import whisk.core.connector.PingMessage
+import whisk.core.logmgmt.LogmetLogActor
+import akka.actor.Props
+import java.net.InetSocketAddress
 
 /**
  * A kafka message handler that invokes actions as directed by message on topic "/actions/invoke".
@@ -65,6 +65,14 @@ class Invoker(
     private implicit val executionContext: ExecutionContext = actorSystem.dispatcher
 
     TransactionId.invoker.mark(this, LoggingMarkers.INVOKER_STARTUP(instance), s"starting invoker instance ${instance}")
+
+    //@TODO read this from properties
+    val remoteLogmet = new InetSocketAddress("logs.opvis.bluemix.net", 9091)
+    val tenantId = "6f0062a9-9d01-4133-b639-dffe72f598f5"
+    val token = ""
+    val clientId = "jwslaptop"
+
+    val logmetClient = actorSystem.actorOf(Props(new LogmetLogActor(remoteLogmet, tenantId, token, clientId, 100, true) ), name = "logger")
 
     /** This generates completion messages back to the controller */
     val producer = new KafkaProducerConnector(config.kafkaHost, executionContext)
@@ -164,6 +172,9 @@ class Invoker(
                     // Since all transaction completions flow through this method and the invariant is that the transaction is
                     // completed only once, there is only one completion message sent to the feed as a result.
                     activationFeed ! releaseResource
+
+                    logmetClient ! activation
+
                     // Since there is no active action taken for completion from the invoker, writing activation record is it.
                     logging.info(this, "recording the activation result to the data store")
                     val result = WhiskActivation.put(activationStore, activation) andThen {
