@@ -42,7 +42,7 @@ import whisk.http.Messages
 import whisk.utils.ExecutionContextFactory
 import whisk.common.Scheduler
 import whisk.core.connector.PingMessage
-import whisk.core.logmgmt.LogmetLogActor
+import whisk.core.logmgmt._
 import akka.actor.Props
 import java.net.InetSocketAddress
 

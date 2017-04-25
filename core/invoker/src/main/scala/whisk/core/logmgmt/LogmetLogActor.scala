@@ -5,21 +5,16 @@ import java.net.InetSocketAddress
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
-
 import scala.collection.JavaConversions.mapAsScalaConcurrentMap
 import scala.concurrent.ExecutionContext
 import scala.concurrent.duration.DurationInt
 import scala.concurrent.duration.FiniteDuration
-
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import com.typesafe.sslconfig.ssl.ClientAuth
-
 import akka.NotUsed
 import akka.actor.Actor
 import akka.actor.ActorRef
 import akka.actor.ActorSystem
-import akka.actor.ReceiveTimeout
-import akka.actor.Status.Failure
 import akka.actor.actorRef2Scala
 import akka.event.LoggingReceive
 import akka.stream.ActorMaterializer
@@ -27,17 +22,13 @@ import akka.stream.OverflowStrategy
 import akka.stream.TLSClientAuth
 import akka.stream.TLSProtocol
 import akka.stream.TLSRole
-import akka.stream.scaladsl.BidiFlow
-import akka.stream.scaladsl.Flow
-import akka.stream.scaladsl.Sink
-import akka.stream.scaladsl.Source
-import akka.stream.scaladsl.TLS
-import akka.stream.scaladsl.Tcp
+import akka.stream.scaladsl._
 import akka.util.ByteString
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 import whisk.core.entity.WhiskActivation
+import akka.stream.BidiShape
 
 // Message formats sent to Logmet
 sealed trait Message
@@ -66,6 +57,11 @@ class MessageBuffer {
 
     def remove(sequence: Integer) = {
        synchronizedMessageMap.remove(sequence)
+       println(s"buffer contains ${synchronizedMessageMap.keySet.size} unacknowledged messages")
+    }
+
+    def removeUntil(sequence: Integer) = {
+       synchronizedMessageMap.dropWhile( _._1 < sequence )
        println(s"buffer contains ${synchronizedMessageMap.keySet.size} unacknowledged messages")
     }
 
@@ -110,11 +106,51 @@ object MessageLogger {
         msg
       }
 
-      val inputLogger = logger("> ")
-      val outputLogger = logger("< ")
+      val inboundLogger = logger("< ")
+      val outboundLogger = logger("> ")
 
       // create BidiFlow with a separate logger function for each of both streams
-      BidiFlow.fromFunctions(outputLogger, inputLogger)
+      BidiFlow.fromFunctions(inboundLogger, outboundLogger)
+    }
+}
+
+object MessageBuffer {
+    def bufferingStage : BidiFlow[Message, Message, Message, Message, NotUsed] = {
+      // create a new BidiFlow from a stream graph
+      BidiFlow.fromGraph(GraphDSL.create() { implicit builder =>
+        val buffer = new MessageBuffer()
+
+        //
+        val outbound = builder.add(Flow[Message].map { msg =>
+            msg match {
+                case d: DataMessage =>
+                    val bufferedMessage = DataMessage(d.tenantId, buffer.nextSequence(), d.message, d.data)
+                    buffer.add(bufferedMessage)
+                    bufferedMessage
+                case _ => msg
+            }
+        })
+
+        //
+        val inbound = builder.add(Flow[Message].map { msg =>
+            msg match {
+                case AcknowledgeMessage(sequence) if sequence > 0  => buffer.removeUntil(sequence)
+                case AcknowledgeMessage(sequence) if sequence == 0  => //authenticated, ignore
+                case UnauthorizedMessage() => // resend
+                case UnknownMessage(error) => println(error) // something went wrong
+            }
+            msg
+        })
+
+        /**
+                   +------+
+             In1 ~>|      |~> Out1
+                   | bidi |
+            Out2 <~|      |<~ In2
+                   +------+
+         */
+        BidiShape(inbound.in, inbound.out, outbound.in, outbound.out)
+      })
     }
 }
 
@@ -311,12 +347,9 @@ class LogmetLogActor(
 
     implicit val materializer = ActorMaterializer()
     import context.system
-    import context.dispatcher
 
     val ident = IdentMessage(clientId)
     val auth = AuthMessage(tenantId, token)
-
-    val buffer = new MessageBuffer()
 
     /**
         +---------------------------+         +----------------------------+         +---------------------------+
@@ -329,68 +362,44 @@ class LogmetLogActor(
         | +------+        +------+  |         |  +----------------------+  |         |  +------+        +------+ |
         +---------------------------+         +----------------------------+         +---------------------------+
     **/
-    val connection = Tcp().outgoingConnection(address.getHostName, address.getPort)
-    val sink = Sink.actorRef(self, {println("initialized")})
-    val source = Source.actorRef(10000, OverflowStrategy.dropNew)
-    val tlsConnectionFlow = MessageEncryptor.tlsStage(TLSRole.client).reversed
-    val logFlow = if (debug) MessageLogger.loggingStage else BidiFlow.identity[Message, Message]
-    val sourceActor = connection.join(tlsConnectionFlow).join(MessageSerializer.serializationStage).join(logFlow).to(sink).runWith(source)
+    def sendLogs(activation: WhiskActivation) {
 
-    authenticate()
+        //val buffer = new MessageBuffer()
 
-    // workaround to keep connection alive, Sink terminates after 120s
-    system.scheduler.schedule(60.seconds, 60.seconds) {
-      sourceActor ! auth
-    }
+        val connection = Tcp().outgoingConnection(address.getHostName, address.getPort)
+        val sink = Sink.ignore
 
-    def convertToDataMessage(activation: WhiskActivation) = {
-      val keys = Map() ++
-        Map("activationid" -> activation.activationId.asString) ++
-        Map("name" -> activation.name.toString()) ++
-        Map("start" -> activation.start.toString()) ++
-        Map("end" -> activation.end.toString()) ++
-        Map("duration" -> activation.duration.map(_.toString()).toString()) ++
-        Map("subject" -> activation.subject.toString())
-      val dataMessages = activation.logs.logs.map { log => DataMessage(tenantId, buffer.nextSequence(), log, keys) }
-      dataMessages.toSeq
+        val source = Source.queue[Message](10000, OverflowStrategy.dropNew)
+        val tlsConnectionFlow = MessageEncryptor.tlsStage(TLSRole.client).reversed
+        val logFlow = if (debug) MessageLogger.loggingStage else BidiFlow.identity[Message, Message]
+        val bufferFlow = MessageBuffer.bufferingStage
+        val sourceQueue = connection.join(tlsConnectionFlow).join(MessageSerializer.serializationStage).join(logFlow).join(bufferFlow).to(sink).runWith(source)
+
+        // authenticate
+        sourceQueue offer ident
+        sourceQueue offer auth
+
+        val keys = Map() ++
+            Map("activationid" -> activation.activationId.asString) ++
+            Map("name" -> activation.name.toString()) ++
+            Map("start" -> activation.start.toString()) ++
+            Map("end" -> activation.end.toString()) ++
+            Map("duration" -> activation.duration.map(_.toString()).toString()) ++
+            Map("subject" -> activation.subject.toString())
+
+        sourceQueue offer WindowMessage(activation.logs.logs.size)
+
+        activation.logs.logs.map { log =>
+            val dataMessage = DataMessage(tenantId, 0, log, keys)
+            sourceQueue offer dataMessage
+        }
     }
 
     // receive when authenticated
     def receive = LoggingReceive {
       case activation: WhiskActivation =>
-        convertToDataMessage(activation).foreach { dataMessage =>
-          buffer.add(dataMessage)
-          MessageTransmitter.send(buffer, dataMessage.sequence, sourceActor)
-        }
-      case AcknowledgeMessage(sequence) if sequence == 0  =>
-        // still authenticated. ignore.
-      case AcknowledgeMessage(sequence) if sequence > 0  =>
-        buffer.remove(sequence)
-      case UnauthorizedMessage =>
-        authenticate()
-      case _ =>
+        sendLogs(activation)
+       case _ =>
         println("got something unkown ")
-    }
-
-    def receiveWhenNotAuthenticated : PartialFunction[Any, Unit] = LoggingReceive {
-      case activation: WhiskActivation =>
-        convertToDataMessage(activation).foreach { dataMessage =>
-          buffer.add(dataMessage)
-        }
-      case AcknowledgeMessage(sequence) if sequence == 0 =>
-        println("supi, I'am authorized")
-        context become receive
-        MessageTransmitter.resendUntil(buffer, buffer.currentSequence(), sourceActor)
-      case AcknowledgeMessage(sequence) if sequence > 0  =>
-        // get an acknowledgement message while waiting for (re)authentication
-        buffer.remove(sequence)
-      case _ =>
-        println("got something unkown ")
-    }
-
-    def authenticate() = {
-      context become receiveWhenNotAuthenticated
-      sourceActor ! ident
-      sourceActor ! auth
     }
 }
