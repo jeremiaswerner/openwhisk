@@ -5,30 +5,41 @@ import java.net.InetSocketAddress
 import java.security.cert.X509Certificate
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicInteger
+
 import scala.collection.JavaConversions.mapAsScalaConcurrentMap
-import scala.concurrent.ExecutionContext
-import scala.concurrent.duration.DurationInt
-import scala.concurrent.duration.FiniteDuration
+import scala.collection.mutable.Queue
+
 import com.typesafe.sslconfig.akka.AkkaSSLConfig
 import com.typesafe.sslconfig.ssl.ClientAuth
+
 import akka.NotUsed
 import akka.actor.Actor
-import akka.actor.ActorRef
 import akka.actor.ActorSystem
-import akka.actor.actorRef2Scala
 import akka.event.LoggingReceive
 import akka.stream.ActorMaterializer
+import akka.stream.Attributes
+import akka.stream.BidiShape
+import akka.stream.Inlet
+import akka.stream.Outlet
 import akka.stream.OverflowStrategy
 import akka.stream.TLSClientAuth
 import akka.stream.TLSProtocol
 import akka.stream.TLSRole
-import akka.stream.scaladsl._
+import akka.stream.scaladsl.BidiFlow
+import akka.stream.scaladsl.Flow
+import akka.stream.scaladsl.Sink
+import akka.stream.scaladsl.Source
+import akka.stream.scaladsl.TLS
+import akka.stream.scaladsl.Tcp
+import akka.stream.stage.GraphStage
+import akka.stream.stage.InHandler
+import akka.stream.stage.OutHandler
+import akka.stream.stage.TimerGraphStageLogic
 import akka.util.ByteString
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
 import javax.net.ssl.X509TrustManager
 import whisk.core.entity.WhiskActivation
-import akka.stream.BidiShape
 
 // Message formats sent to Logmet
 sealed trait Message
@@ -47,22 +58,20 @@ class MessageBuffer {
     val sequence = new AtomicInteger(1)
     val synchronizedMessageMap = new ConcurrentHashMap[Integer, DataMessage]()
 
-    def add(dataMessage: DataMessage, maximumBufferSize: Integer=100) = {
-       if (synchronizedMessageMap.keySet.size > maximumBufferSize) {
-         println(s"ignore message with sequence ${dataMessage.sequence}")
-       } else {
-         synchronizedMessageMap.put(dataMessage.sequence, dataMessage)
-       }
+    def add(dataMessage: DataMessage) = {
+        synchronizedMessageMap.put(dataMessage.sequence, dataMessage)
     }
 
     def remove(sequence: Integer) = {
        synchronizedMessageMap.remove(sequence)
-       println(s"buffer contains ${synchronizedMessageMap.keySet.size} unacknowledged messages")
+       println(s"removed ${sequence}, buffer contains ${size()} messages")
     }
 
-    def removeUntil(sequence: Integer) = {
-       synchronizedMessageMap.dropWhile( _._1 < sequence )
-       println(s"buffer contains ${synchronizedMessageMap.keySet.size} unacknowledged messages")
+    def removeWindow(lastSequence: Integer, size: Integer) = {
+       val firstSequence = lastSequence - (size)  + 1
+       for (s <- firstSequence until lastSequence + 1) {
+           remove(s)
+       }
     }
 
     def nextSequence() = sequence.getAndIncrement
@@ -70,32 +79,131 @@ class MessageBuffer {
     def currentSequence() = sequence.get()
 
     def toSortedSeq() = synchronizedMessageMap.toSeq.sortBy(_._1)
+    def size() = synchronizedMessageMap.size()
 
     def get(seq: Integer) = synchronizedMessageMap.get(seq)
 }
 
-object MessageTransmitter {
+// http://blog.kunicki.org/blog/2016/07/20/implementing-a-custom-akka-streams-graph-stage/
+final class MessageBufferWithBackpressure(ident: IdentMessage, auth: AuthMessage)
+  extends GraphStage[BidiShape[Message, Message, Message, Message]] {
 
-    def send(buffer: MessageBuffer, sequence: Integer, actor: ActorRef ): Unit = {
-      actor ! WindowMessage(1)
-      actor ! buffer.get(sequence)
+  val inbound_in = Inlet[Message]("MessageBufferWithBackpressure.inbound_in")
+  val inbound_out = Outlet[Message]("MessageBufferWithBackpressure.inbound_out")
+  val outbound_in = Inlet[Message]("MessageBufferWithBackpressure.outbound_in")
+  val outbound_out = Outlet[Message]("MessageBufferWithBackpressure.outbound_out")
+
+  override def shape = BidiShape.of(inbound_in, inbound_out, outbound_in, outbound_out)
+
+  override def createLogic(inheritedAttributes: Attributes) = new TimerGraphStageLogic(shape) {
+
+    private val maxWindowSize = 10
+    private val maxBufferSize = 100
+
+    private var isAuthorized = false
+    private var downstreamWaiting = false
+    private var currentWindowSize = maxWindowSize
+
+    private val messageBuffer = Queue[DataMessage]()
+    def messageBufferFull = messageBuffer.length >= maxWindowSize
+
+    private val waitAckBuffer = new MessageBuffer()
+    def waitAckBufferFull = waitAckBuffer.size() >= 100
+
+    def checkWindowAndSend() = {
+        if (currentWindowSize == maxWindowSize) {
+            push(outbound_out, WindowMessage(maxWindowSize))
+            currentWindowSize = 0
+        } else  {
+            val elem = messageBuffer.dequeue()
+            push(outbound_out, elem)
+            waitAckBuffer.add(elem)
+            currentWindowSize += 1
+        }
     }
 
-    def sendUntil(buffer: MessageBuffer, sequence: Integer, actor: ActorRef ): Unit = {
-      buffer.toSortedSeq().foreach { case (s, m) if (s <= sequence) => send(buffer, s, actor) }
-    }
-
-    // re-send all data messages to the actor with sequence number lower than 'sequence'
-    def resendUntil(buffer: MessageBuffer, sequence: Integer, actor: ActorRef, duration: FiniteDuration = 5.seconds)(implicit system: ActorSystem, execution: ExecutionContext) : Unit = {
-      // data messages needs to be send in order of the sequence, otherwise will only retrieve an ack for the highest sequence
-      //@todo: leverage window size here to send multiple messages at once
-      sendUntil(buffer, sequence, actor)
-      system.scheduler.scheduleOnce(duration) {
-        // schedule with current sequence number to avoid sending new arrivals
-        resendUntil(buffer, buffer.currentSequence(), actor)
+    // inbound, i.e. from logmet
+    setHandlers(inbound_in, inbound_out, new InHandler with OutHandler {
+      override def onPush(): Unit = {
+        val nextMessage = grab(inbound_in)
+        isAuthorized = nextMessage match {
+            case AcknowledgeMessage(sequence) if sequence > 0  =>
+                // free ack. sequence
+                waitAckBuffer.removeWindow(sequence, maxWindowSize)
+                true
+            case AcknowledgeMessage(sequence) if sequence == 0 =>
+                true
+            case UnauthorizedMessage() =>
+                false
+            case UnknownMessage(error) =>
+                println(error) // something went wrong
+                false
+        }
+        push(inbound_out, nextMessage)
       }
+
+      override def onPull(): Unit = {
+        pull(inbound_in)
+      }
+
+      override def onUpstreamFinish(): Unit = {
+        completeStage()
+      }
+    })
+
+    // outbound, i.e. to logmet
+    setHandlers(outbound_in, outbound_out, new InHandler with OutHandler {
+      override def onPush(): Unit = {
+        // get a datamessage message and send if authorized.
+        // otherwise just buffer
+        val nextMessage = grab(outbound_in)
+        nextMessage match {
+            case d: DataMessage =>
+                val msg = DataMessage(d.tenantId, waitAckBuffer.nextSequence(), d.message, d.data)
+                messageBuffer.enqueue(msg)
+            case _ => // ignore
+        }
+
+        if (downstreamWaiting && isAuthorized) {
+            checkWindowAndSend()
+            downstreamWaiting = false
+        }
+      }
+
+      override def onPull(): Unit = {
+          // pull as long as capacity available,
+          // otherwise wait until upstream sends acknowledgements
+          if (messageBuffer.isEmpty) {
+              downstreamWaiting = true
+          } else {
+              checkWindowAndSend()
+          }
+
+          if (!messageBufferFull && !hasBeenPulled(outbound_in)) {
+            pull(outbound_in)
+          }
+      }
+
+      override def onUpstreamFinish(): Unit = {
+        if (messageBuffer.nonEmpty) {
+           // emit the rest
+           emit(outbound_out, WindowMessage(messageBuffer.length))
+           emitMultiple(outbound_out, messageBuffer.toIterator)
+        }
+        completeStage()
+      }
+
+    })
+
+    override def preStart(): Unit = {
+        emit(outbound_out, ident)
+        emit(outbound_out, auth)
+        // a detached stage needs to start upstream demand
+        // itself as it is not triggered by downstream demand
+        pull(outbound_in)
     }
 
+  }
 }
 
 object MessageLogger {
@@ -111,46 +219,6 @@ object MessageLogger {
 
       // create BidiFlow with a separate logger function for each of both streams
       BidiFlow.fromFunctions(inboundLogger, outboundLogger)
-    }
-}
-
-object MessageBuffer {
-    def bufferingStage : BidiFlow[Message, Message, Message, Message, NotUsed] = {
-      // create a new BidiFlow from a stream graph
-      BidiFlow.fromGraph(GraphDSL.create() { implicit builder =>
-        val buffer = new MessageBuffer()
-
-        //
-        val outbound = builder.add(Flow[Message].map { msg =>
-            msg match {
-                case d: DataMessage =>
-                    val bufferedMessage = DataMessage(d.tenantId, buffer.nextSequence(), d.message, d.data)
-                    buffer.add(bufferedMessage)
-                    bufferedMessage
-                case _ => msg
-            }
-        })
-
-        //
-        val inbound = builder.add(Flow[Message].map { msg =>
-            msg match {
-                case AcknowledgeMessage(sequence) if sequence > 0  => buffer.removeUntil(sequence)
-                case AcknowledgeMessage(sequence) if sequence == 0  => //authenticated, ignore
-                case UnauthorizedMessage() => // resend
-                case UnknownMessage(error) => println(error) // something went wrong
-            }
-            msg
-        })
-
-        /**
-                   +------+
-             In1 ~>|      |~> Out1
-                   | bidi |
-            Out2 <~|      |<~ In2
-                   +------+
-         */
-        BidiShape(inbound.in, inbound.out, outbound.in, outbound.out)
-      })
     }
 }
 
@@ -351,6 +419,14 @@ class LogmetLogActor(
     val ident = IdentMessage(clientId)
     val auth = AuthMessage(tenantId, token)
 
+    val connection = Tcp().outgoingConnection(address.getHostName, address.getPort)
+    val sink = Sink.ignore
+
+    val source = Source.queue[Message](10000, OverflowStrategy.dropNew)
+    val tlsConnectionFlow = MessageEncryptor.tlsStage(TLSRole.client).reversed
+    val logFlow = if (debug) MessageLogger.loggingStage else BidiFlow.identity[Message, Message]
+    val serializationFlow = MessageSerializer.serializationStage
+
     /**
         +---------------------------+         +----------------------------+         +---------------------------+
         | Flow                      |         | Serialization BidiFlow     |         | tlsConnectionFlow         |
@@ -364,20 +440,13 @@ class LogmetLogActor(
     **/
     def sendLogs(activation: WhiskActivation) {
 
-        //val buffer = new MessageBuffer()
-
-        val connection = Tcp().outgoingConnection(address.getHostName, address.getPort)
-        val sink = Sink.ignore
-
-        val source = Source.queue[Message](10000, OverflowStrategy.dropNew)
-        val tlsConnectionFlow = MessageEncryptor.tlsStage(TLSRole.client).reversed
-        val logFlow = if (debug) MessageLogger.loggingStage else BidiFlow.identity[Message, Message]
-        val bufferFlow = MessageBuffer.bufferingStage
-        val sourceQueue = connection.join(tlsConnectionFlow).join(MessageSerializer.serializationStage).join(logFlow).join(bufferFlow).to(sink).runWith(source)
+        val count = activation.logs.logs.length
+        val bufferFlow = new MessageBufferWithBackpressure(ident, auth)
+        val sourceQueue = connection.join(tlsConnectionFlow).join(serializationFlow).join(logFlow).join(bufferFlow).to(sink).runWith(source)
 
         // authenticate
-        sourceQueue offer ident
-        sourceQueue offer auth
+        //sourceQueue offer ident
+        //sourceQueue offer auth
 
         val keys = Map() ++
             Map("activationid" -> activation.activationId.asString) ++
@@ -387,12 +456,13 @@ class LogmetLogActor(
             Map("duration" -> activation.duration.map(_.toString()).toString()) ++
             Map("subject" -> activation.subject.toString())
 
-        sourceQueue offer WindowMessage(activation.logs.logs.size)
+        //sourceQueue offer WindowMessage(activation.logs.logs.size)
 
         activation.logs.logs.map { log =>
             val dataMessage = DataMessage(tenantId, 0, log, keys)
             sourceQueue offer dataMessage
         }
+        //sourceQueue.complete()
     }
 
     // receive when authenticated
