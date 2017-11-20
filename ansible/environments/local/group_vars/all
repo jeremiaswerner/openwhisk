@@ -1,4 +1,5 @@
 whisk_version_name: local
+ansible_python_interpreter: /Library/Frameworks/Python.framework/Versions/3.5/bin/python3 
 config_root_dir: /tmp
 whisk_logs_dir: /tmp/wsklogs
 docker_registry: ""
