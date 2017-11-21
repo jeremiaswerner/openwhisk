@@ -346,7 +346,8 @@ object LoadBalancerService {
       Map(
         kafkaTopicsCompletedRetentionBytes -> 1024.MB.toBytes.toString,
         kafkaTopicsCompletedRetentionMS -> 1.hour.toMillis.toString,
-        kafkaTopicsCompletedSegmentBytes -> 512.MB.toBytes.toString) ++
+        kafkaTopicsCompletedSegmentBytes -> 512.MB.toBytes.toString,
+        kafkaReplicationFactor -> "1") ++
       Map(
         loadbalancerInvokerBusyThreshold -> null,
         controllerBlackboxFraction -> null,
