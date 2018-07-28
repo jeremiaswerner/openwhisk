@@ -363,18 +363,7 @@ class ShardingContainerPoolBalancer(config: WhiskConfig, controllerInstance: Con
                                 invoker: InvokerInstanceId): Unit = {
     val aid = response.fold(l => l, r => r.activationId)
 
-    val invocationResult = if (forced) {
-      InvocationFinishedResult.Timeout
-    } else {
-      // If the response contains a system error, report that, otherwise report Success
-      // Left generally is considered a Success, since that could be a message not fitting into Kafka
-      val isSystemError = response.fold(_ => false, _.response.isWhiskError)
-      if (isSystemError) {
-        InvocationFinishedResult.SystemError
-      } else {
-        InvocationFinishedResult.Success
-      }
-    }
+    val invocationResult = InvocationFinishedResult.Success
 
     activations.remove(aid) match {
       case Some(entry) =>
